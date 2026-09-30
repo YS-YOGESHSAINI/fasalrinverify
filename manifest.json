@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Sequential Auto Clicker",
+  "version": "1.4",
+  "description": "Auto-clicker with side panel controls.",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting"
+  ],
+  "action": {
+    "default_title": "Open Auto Clicker Panel"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"], 
+      "js": ["content.js"]
+    }
+  ]
+}
