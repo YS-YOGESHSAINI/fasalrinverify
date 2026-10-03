@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""
+fasalrin_regular.py
+-------------------
+Automates the IS "regular" (new-FY) Loan Application entry on
+https://fasalrin.gov.in for the accounts in 3119_IS_REG.csv, using Playwright.
+Recorded from a live walkthrough on 2026-09-08.
+
+FLOW (per CSV row, exactly what the branch user does by hand)
+  1. side nav -> Loan Application -> popup "Fetch record by Aadhaar Number"
+     Financial Year = 2025-2026, Aadhaar = CSV "Aadhaar No.", FETCH RECORD
+  2. popup answers:
+       "Beneficiary details exist in the system" -> Account numbers dropdown:
+            pick the CSV "Account No."  (not in the list -> ACCT_NOT_IN_DROPDOWN, BACK TO DASHBOARD)
+            -> OK
+       "Kindly click OK and enter farmer-details" -> NOT_IN_SYSTEM (OK, re-open popup)
+  3. Applicant Details : Application Type = Normal -> UPDATE & CONTINUE
+  4. Account Details   : UPDATE & CONTINUE
+  5. Financial Details : KCC loan sanctioned on = CSV "Disb. Date" (calendar click)
+                         drawing limit          = CSV "DP"
+                         sanction eligibility   = raised to DP if it is below DP, else untouched
+                         -> SAVE & CONTINUE
+  6. Activity          : Loan Sanctioned (INR) = DP (same as drawing limit) -> SAVE & CONTINUE
+  7. Term Loan         : must show Term Loan For Current FY = 0.00 -> PREVIEW
+  8. Preview page      : verify account / Aadhaar / date / amounts -> SUBMIT -> CONFIRM
+                         -> "Loan application <no> submitted successfully" -> OK
+  9. write status + app no to the CSV, next row.
+
+SAFETY
+  * DRY_RUN = True: does everything up to the preview page, verifies it, then presses
+    BACK and never submits.  DRY_RUN = False really submits.
+  * PAUSE_BEFORE_SUBMIT = True: shows the preview values and waits for ENTER.
+  * SUBMIT_LIMIT stops the run after that many REAL submissions.
+  * Re-running resumes: rows whose Status is in DONE_STATES are skipped.
+  * CSV is written after EVERY row (a .bak is kept), so a crash never loses progress.
+  * Any unexpected page -> screenshot in ./screenshots + Status ERROR:*, move on.
+
+You log in yourself (mobile + password + captcha). The script waits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import re
+import time
+from datetime import date
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ----------------------------------------------------------------------------
+# CONFIG  — edit these
+# ----------------------------------------------------------------------------
+INPUT_CSV   = "3119_IS_REG.csv"      # default; override on the command line: python fasalrin_regular.py <file.csv>
+OUTPUT_CSV  = INPUT_CSV              # same file = update in place (a .bak is kept)
+FIN_YEAR    = "2025-2026"
+DRY_RUN     = False                  # <<< True = fill + verify preview, never submit.  False = really submit.
+PAUSE_BEFORE_SUBMIT = False          # <<< True = show preview values + wait for ENTER before each submit
+SUBMIT_LIMIT = 1000                   # <<< stop after this many REAL submissions; rerun for the next batch
+MAX_ITER    = 2000                   # safety: max rows walked in one run (incl. skips)
+HEADLESS    = False
+PROFILE_DIR = ".pw_profile"
+SLOWMO_MS   = 30
+NO_PROMPT   = os.environ.get("NO_PROMPT") == "1"   # 1 = never wait for ENTER; poll for login instead
+SKIP_DP_ZERO = True                  # rows with DP 0 / blank -> DP_ZERO, never entered
+
+BASE = "https://fasalrin.gov.in"
+SHOTS = Path("screenshots"); SHOTS.mkdir(exist_ok=True)
+
+COL_ACCT   = "Account No."
+COL_AADH   = "Aadhaar No."
+COL_DISB   = "Disb. Date"            # dd-mm-yyyy
+COL_DP     = "DP"
+COL_STATUS = "Status"
+COL_DL     = "Drawing Limit (entered)"
+COL_APPNO  = "Loan App No"
+COL_DETAIL = "Detail"
+
+DONE_STATES = {"COMPLETED", "NOT_IN_SYSTEM", "ACCT_NOT_IN_DROPDOWN", "DRY_OK",
+               "NO_AADHAAR", "DP_ZERO", "NO_ACTIVITY", "AADHAAR_REVERIFY", "APPLICANT_INCOMPLETE"}
+
+MONTHS = ["January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"]
+
+BTN = lambda name: re.compile(rf"^\s*{name}\s*$", re.I)
+
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+def parse_dmy(s: str) -> date:
+    d, m, y = (int(x) for x in re.split(r"[-/]", s.strip()))
+    return date(y, m, d)
+
+
+def money_to_float(s: str) -> float:
+    return float(re.sub(r"[^\d.]", "", s or "0") or 0)
+
+
+def load_rows():
+    raw = open(INPUT_CSV, "rb").read().decode("utf-8-sig")
+    rows = list(csv.reader(io.StringIO(raw, newline="")))
+    header = rows[0]
+    for col in (COL_STATUS, COL_DL, COL_APPNO, COL_DETAIL):
+        if col not in header:
+            header.append(col)
+    for r in rows[1:]:
+        while len(r) < len(header):
+            r.append("")
+    idx = {c: header.index(c) for c in header}
+    return header, rows, idx
+
+
+def save_rows(header, rows):
+    tmp = OUTPUT_CSV + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows[1:])
+    if os.path.exists(OUTPUT_CSV) and not os.path.exists(OUTPUT_CSV + ".bak"):
+        try:
+            os.replace(OUTPUT_CSV, OUTPUT_CSV + ".bak")
+        except OSError:
+            pass
+    os.replace(tmp, OUTPUT_CSV)
+
+
+def shot(page, name):
+    try:
+        page.screenshot(path=str(SHOTS / f"{name}_{int(time.time())}.png"), full_page=True)
+    except Exception:
+        pass
+
+
+def body_text(page) -> str:
+    try:
+        return page.evaluate("() => document.body.innerText")
+    except Exception:
+        return ""
+
+
+def modal_text(page) -> str:
+    try:
+        return page.evaluate("""() => [...document.querySelectorAll('.modal-content')]
+            .filter(m => m.offsetParent !== null)
+            .map(m => m.innerText.replace(/\\s+/g,' ')).join(' | ')""")
+    except Exception:
+        return ""
+
+
+def is_logged_out(page) -> bool:
+    try:
+        return page.evaluate("""() => {
+            const pw = document.querySelector('input[type="password"]');
+            const login = !!pw && pw.offsetParent !== null;
+            const menu  = !!document.querySelector('ul#menu')
+                       || !!document.querySelector('a[href="/loan-application-form"]')
+                       || [...document.querySelectorAll('a,button,span')]
+                            .some(e => /^\s*Logout\s*$/i.test(e.textContent || ''));
+            return login || !menu;
+        }""")
+    except Exception:
+        return False
+
+
+def require_login(page, reason="Session logged out"):
+    print(f"\n  !! {reason}. In the browser: LOG IN (mobile + password + captcha).", flush=True)
+    while True:
+        if NO_PROMPT:
+            for _ in range(20):                 # ~10 s between "still waiting" lines
+                page.wait_for_timeout(500)
+                if not is_logged_out(page):
+                    page.wait_for_timeout(1500)
+                    print("  [login] session is back — continuing", flush=True)
+                    return
+            print("  ... still waiting for login", flush=True)
+            continue
+        input("  >> press ENTER once you are logged in (any page): ")
+        page.wait_for_timeout(500)
+        if not is_logged_out(page):
+            return
+
+
+def wait_for(page, fn, seconds, what):
+    """Poll fn() every 150 ms until truthy; raise after `seconds`."""
+    for _ in range(int(seconds * 1000 / 150)):
+        try:
+            v = fn()
+        except Exception:
+            v = None
+        if v:
+            return v
+        page.wait_for_timeout(150)
+    raise RuntimeError(f"timeout waiting for {what}")
+
+
+def click_side_nav(page, href):
+    """SPA routerLink click (never page.goto — a hard load logs the session out)."""
+    a = page.locator(f'ul#menu a[href="{href}"]')
+    if a.count() == 0:
+        a = page.locator(f'a[href="{href}"]')
+    a.first.evaluate("el => el.click()")
+
+
+def dismiss_ok_dialogs(page):
+    """Click OK / CANCEL on any visible generic modal (not the fetch popup)."""
+    for _ in range(3):
+        b = page.locator('.modal-content:visible button', has_text=BTN("OK"))
+        if b.count() == 0:
+            b = page.locator('.modal-content:visible button', has_text=BTN("CANCEL"))
+        if b.count() == 0:
+            return
+        try:
+            b.first.click()
+            page.wait_for_timeout(400)
+        except Exception:
+            return
+
+
+# ----------------------------------------------------------------------------
+# popup: Fetch record by Aadhaar
+# ----------------------------------------------------------------------------
+def popup_visible(page) -> bool:
+    # must be the Aadhaar box INSIDE the fetch modal - the blank new-farmer form has one too
+    return page.locator('.modal-content:visible input[name="aadharNumber"]').count() > 0 \
+        and page.locator('.modal-content:visible select[name="financialYear"]').count() > 0
+
+
+def open_fetch_popup(page):
+    """Get the 'Fetch record by Aadhaar Number' popup on screen."""
+    if popup_visible(page):
+        return
+    dismiss_ok_dialogs(page)
+    if popup_visible(page):
+        return
+    # side nav: Dashboard first (so the Loan Application route re-mounts), then Loan Application
+    if "/loan-application-form" in page.url:
+        click_side_nav(page, "/dashboard")
+        page.wait_for_timeout(800)
+    click_side_nav(page, "/loan-application-form")
+    try:
+        wait_for(page, lambda: popup_visible(page), 15, "fetch popup")
+    except RuntimeError:
+        if is_logged_out(page):
+            require_login(page)
+            return open_fetch_popup(page)
+        raise
+
+
+def fetch_record(page, aadhaar: str) -> str:
+    """Fill FY + Aadhaar, click FETCH RECORD, return 'exists' | 'not_in_system' | other text."""
+    fy = page.locator('.modal-content:visible select[name="financialYear"]').first
+    for _ in range(5):
+        fy.select_option(FIN_YEAR)
+        page.wait_for_timeout(200)
+        if fy.evaluate("s => s.value") == FIN_YEAR:
+            break
+    box = page.locator('.modal-content:visible input[name="aadharNumber"]').first
+    box.click()
+    box.fill("")
+    box.fill(aadhaar)
+    box.dispatch_event("input"); box.dispatch_event("change")
+    page.locator('.modal-content:visible button', has_text=BTN("FETCH RECORD")).first.click()
+
+    def outcome():
+        t = modal_text(page)
+        if re.search(r"Beneficiary details exist", t, re.I):
+            return "exists"
+        if re.search(r"Kindly click OK and enter farmer-details", t, re.I):
+            return "not_in_system"
+        if t and "Fetch record by Aadhaar" not in t:
+            return "other:" + t[:160]
+        return None
+    return wait_for(page, outcome, 30, "FETCH RECORD response")
+
+
+def choose_account(page, acct: str) -> bool:
+    sel = page.locator('.modal-content:visible select[name="accountNumbers"]').first
+    sel.wait_for(timeout=10000)
+    opts = sel.evaluate("s => [...s.options].map(o => o.value.trim())")
+    if acct not in opts:
+        print(f"\n    dropdown accounts: {opts}")
+        return False
+    sel.select_option(acct)
+    page.wait_for_timeout(200)
+    sel.dispatch_event("change")
+    return True
+
+
+# ----------------------------------------------------------------------------
+# form tabs
+# ----------------------------------------------------------------------------
+def active_pane(page) -> str:
+    try:
+        return page.evaluate("() => (document.querySelector('.tab-pane.active') || {}).id || ''")
+    except Exception:
+        return ""
+
+
+def validation_msgs(page) -> str:
+    """Red 'Please select/enter ...' messages visible in the active tab pane."""
+    try:
+        return page.evaluate("""() => [...document.querySelectorAll('.tab-pane.active *')]
+            .filter(e => e.children.length === 0 && e.offsetParent !== null
+                      && /^\\s*Please (select|enter|provide|verify)/i.test(e.textContent || ''))
+            .map(e => e.textContent.trim()).join('; ')""")
+    except Exception:
+        return ""
+
+
+def wait_pane(page, n: int, seconds=30, retry_btn=None):
+    """Wait for tab pane n. Portal 'Warning: ... Please verify' modals are acknowledged with OK
+    (then retry_btn, e.g. SAVE & CONTINUE, is clicked again if the pane still hasn't changed)."""
+    state = {"warned": 0}
+    def ready():
+        if active_pane(page) == f"formTabs-tabpane-{n}":
+            return "ok"
+        mt = modal_text(page)
+        if mt and re.search(r"warning|please verify", mt, re.I) and state["warned"] < 3:
+            state["warned"] += 1
+            print(f"\n    portal warning acknowledged: {mt[:110]}", flush=True)
+            page.locator('.modal-content:visible button', has_text=BTN("OK")).first.click()
+            page.wait_for_timeout(1500)
+            if active_pane(page) != f"formTabs-tabpane-{n}" and retry_btn is not None:
+                retry_btn.click()
+                page.wait_for_timeout(500)
+            return None
+        v = validation_msgs(page)
+        if v:
+            return "validation:" + v
+        return None
+    r = wait_for(page, ready, seconds, f"tab pane {n}")
+    if r != "ok":
+        raise RuntimeError(f"portal {r}")
+    page.wait_for_timeout(300)
+
+
+def pane(page, n: int):
+    return page.locator(f"#formTabs-tabpane-{n}")
+
+
+def fill_amount(page, locator, value):
+    locator.click()
+    locator.fill("")
+    locator.fill(str(value))
+    locator.dispatch_event("input")
+    locator.dispatch_event("change")
+    locator.press("Tab")
+    page.wait_for_timeout(200)
+
+
+def pick_calendar_date(page, date_input, target: date):
+    """Open the rmdp picker attached to `date_input` and click `target`."""
+    date_input.click()
+    page.wait_for_selector(".rmdp-header-values", timeout=8000)
+    tgt = (target.year, target.month)
+    for _ in range(30):
+        hdr = page.locator(".rmdp-header-values").first.inner_text()
+        m = re.search(r"([A-Za-z]+)\D+(\d{4})", hdr)
+        if not m:
+            raise RuntimeError(f"unreadable calendar header: {hdr!r}")
+        cur = (int(m.group(2)), MONTHS.index(m.group(1)) + 1)
+        if cur == tgt:
+            break
+        arrow = ".rmdp-right" if cur < tgt else ".rmdp-left"
+        page.locator(f".rmdp-arrow-container{arrow}").first.click()
+        page.wait_for_timeout(120)
+    else:
+        raise RuntimeError(f"could not reach {target:%m/%Y} in calendar")
+    ok = page.evaluate(
+        """(day) => {
+            for (const d of document.querySelectorAll('.rmdp-day')) {
+              const sp = d.querySelector('span');
+              if (!sp || sp.textContent.trim() !== String(day)) continue;
+              if (d.classList.contains('rmdp-day-hidden')) continue;
+              if (d.classList.contains('rmdp-disabled')) return 'disabled';
+              sp.click();
+              return 'ok';
+            }
+            return 'notfound';
+        }""", target.day)
+    if ok != "ok":
+        raise RuntimeError(f"date {target:%d/%m/%Y} not selectable ({ok})")
+    want = f"{target:%d/%m/%Y}"
+    wait_for(page, lambda: date_input.input_value().strip() == want, 5, f"date {want} to register")
+
+
+PRIMARY_ACTIVITY_DEFAULT = "Agri Crops"   # picked when the portal leaves Primary Activity blank
+
+
+def ensure_primary_activity(page):
+    """Applicant tab: if 'Primary Activity' dropdown is unselected, choose PRIMARY_ACTIVITY_DEFAULT."""
+    handle = page.evaluate_handle("""() => {
+        const lab = [...document.querySelectorAll('#formTabs-tabpane-1 label')]
+            .find(l => /^\\s*Primary Activity/i.test(l.textContent || ''));
+        if (!lab) return null;
+        const grp = lab.closest('.form-group') || lab.parentElement;
+        return grp ? grp.querySelector('select') : null;
+    }""")
+    el = handle.as_element()
+    if el is None:
+        return
+    cur = el.evaluate("s => (s.options[s.selectedIndex] || {}).text || ''").strip()
+    if cur and cur.lower() != "select":
+        return
+    el.select_option(label=PRIMARY_ACTIVITY_DEFAULT)
+    el.dispatch_event("input"); el.dispatch_event("change")
+    page.wait_for_timeout(300)
+    got = el.evaluate("s => (s.options[s.selectedIndex] || {}).text || ''").strip()
+    if got != PRIMARY_ACTIVITY_DEFAULT:
+        raise RuntimeError(f"could not set Primary Activity (now {got!r})")
+    print(f"\n    primary activity was blank -> {PRIMARY_ACTIVITY_DEFAULT}", flush=True)
+
+
+# ----------------------------------------------------------------------------
+# process one CSV row -> (status, drawing_limit_entered, app_no, detail)
+# ----------------------------------------------------------------------------
+def process_row(page, acct: str, aadhaar: str, disb: date, dp: int, stage: dict):
+    stage["s"] = "start"
+    open_fetch_popup(page)
+    res = fetch_record(page, aadhaar)
+    stage["s"] = "fetched"
+
+    if res == "not_in_system":
+        page.locator('.modal-content:visible button', has_text=BTN("OK")).first.click()
+        page.wait_for_timeout(800)
+        click_side_nav(page, "/dashboard")          # OK opens a blank new-farmer form -> leave it
+        page.wait_for_timeout(800)
+        return "NOT_IN_SYSTEM", "", "", "aadhaar not in portal (no record found)"
+    if res != "exists":
+        shot(page, f"fetch_{acct}")
+        raise RuntimeError(f"unexpected FETCH response: {res}")
+
+    if not choose_account(page, acct):
+        page.locator('.modal-content:visible button', has_text=BTN("BACK TO DASHBOARD")).first.click()
+        page.wait_for_timeout(800)
+        return "ACCT_NOT_IN_DROPDOWN", "", "", "csv account not offered for this aadhaar"
+    page.locator('.modal-content:visible button', has_text=BTN("OK")).first.click()
+
+    # ---- 1. Applicant Details ----
+# ---- 1. Applicant Details ----
+    wait_pane(page, 1)
+    at = page.locator('select[name="applicationType"]').first
+    at.wait_for(timeout=15000)
+    for _ in range(5):
+        at.select_option(label="Normal")
+        page.wait_for_timeout(200)
+        if at.evaluate("s => (s.options[s.selectedIndex]||{}).text.trim()") == "Normal":
+            break
+    at.dispatch_event("change")
+    ensure_primary_activity(page)
+
+    # 1. Check and click the REVERIFY button if visible
+    reverify_btn = pane(page, 1).locator("button.applicant_input_inner_btn", has_text=BTN("REVERIFY"))
+    if reverify_btn.count() > 0 and reverify_btn.first.is_visible():
+        print("\n    found REVERIFY button — clicking it", flush=True)
+        reverify_btn.first.click()
+        page.wait_for_timeout(1000)  # pause for action to register
+
+    # 2. Check and click the VERIFY button (green-btn aadharBtnWidth) if visible
+    verify_btn = page.locator("button.green-btn.aadharBtnWidth", has_text=BTN("VERIFY"))
+    if verify_btn.count() > 0 and verify_btn.first.is_visible():
+        print("\n    found VERIFY button — clicking it", flush=True)
+        verify_btn.first.click()
+        page.wait_for_timeout(1500)  # pause for verification response
+
+    pane(page, 1).locator("button", has_text=BTN("UPDATE & CONTINUE")).first.click()
+    stage["s"] = "applicant"
+    # ---- 2. Account Details ----
+    try:
+        wait_pane(page, 2)
+    except RuntimeError as e:
+        if re.search(r"verify Aadhaar", str(e), re.I):
+            shot(page, f"reverify_{acct}")
+            click_side_nav(page, "/dashboard")
+            page.wait_for_timeout(800)
+            return "AADHAAR_REVERIFY", "", "", "portal asks REVERIFY Aadhaar on applicant tab: do by hand"
+        if str(e).startswith("portal validation:"):
+            # applicant tab missing data the branch must key in (state/district/village/...)
+            shot(page, f"applicant_{acct}")
+            click_side_nav(page, "/dashboard")
+            page.wait_for_timeout(800)
+            return "APPLICANT_INCOMPLETE", "", "", "applicant tab: " + str(e)[len("portal validation:"):][:120]
+        raise
+    pane(page, 2).locator("button", has_text=BTN("UPDATE & CONTINUE")).first.click()
+    stage["s"] = "account"
+
+    # ---- 3. Financial Details ----
+    wait_pane(page, 3)
+    fin = page.locator("#finance")
+    date_in = fin.locator("input.rmdp-input").first
+    elig_in = fin.locator('input[name="loanSanctionAmount"]').first
+    dl_in   = fin.locator('input[name="drawingLimit"]').first
+    date_in.wait_for(timeout=15000)
+    elig_in.wait_for(timeout=15000)
+    dl_in.wait_for(timeout=15000)
+    # existing farmers: portal prefills eligibility/DL within ~2 s. New farmers: fields stay
+    # blank (eligibility 0 -> raised to DP below). Give prefill a short chance, then go on.
+    try:
+        wait_for(page, lambda: elig_in.input_value().strip() != "" or dl_in.input_value().strip() != "",
+                 3, "financial fields to prefill")
+    except RuntimeError:
+        print("\n    financial fields blank (new farmer) -> eligibility & DL = DP", flush=True)
+
+    pick_calendar_date(page, date_in, disb)
+    elig = money_to_float(elig_in.input_value())
+    elig_new = elig
+    if elig < dp:                              # rule: eligibility below DP -> make both = DP
+        elig_new = dp
+        fill_amount(page, elig_in, dp)
+    fill_amount(page, dl_in, dp)
+    # make sure the values stuck (Angular sometimes re-renders)
+    wait_for(page, lambda: money_to_float(dl_in.input_value()) == dp and
+                           money_to_float(elig_in.input_value()) == elig_new,
+             5, "financial amounts to stick")
+    fin_save = fin.locator("button", has_text=BTN("SAVE & CONTINUE")).first
+    fin_save.click()
+    stage["s"] = "financial_saved"
+
+    # ---- 4. Activity ----
+    wait_pane(page, 4, retry_btn=fin_save)
+    act = page.locator("#activity")
+    ls_in = act.locator('input[name="loanSanctionedAmount"]').first
+    try:
+        ls_in.wait_for(timeout=4000)
+    except PWTimeout:
+        # new farmer: no activity added. Adding one needs land location / crop / survey no /
+        # khata / land area -> manual job. Leave the draft, skip the row with a remark.
+        shot(page, f"noactivity_{acct}")
+        click_side_nav(page, "/dashboard")
+        page.wait_for_timeout(800)
+        return "NO_ACTIVITY", "", "", "activity tab empty: add activity (land/crop/survey/khata) by hand"
+    act_date = act.locator("input.rmdp-input").first
+    act_date.wait_for(timeout=10000)
+    page.wait_for_timeout(500)
+    if act_date.input_value().strip() != f"{disb:%d/%m/%Y}":
+        try:
+            wait_for(page, lambda: act_date.input_value().strip() == f"{disb:%d/%m/%Y}", 4,
+                     "activity sanction date = disbursal date")
+        except RuntimeError:
+            pick_calendar_date(page, act_date, disb)     # not auto-filled (new farmer) -> pick it
+    fill_amount(page, ls_in, dp)
+    wait_for(page, lambda: money_to_float(ls_in.input_value()) == dp, 5, "activity amount to stick")
+    act_save = act.locator("button", has_text=BTN("SAVE & CONTINUE")).first
+    act_save.click()
+    stage["s"] = "activity_saved"
+
+    # ---- 5. Term Loan ----
+    wait_pane(page, 5, retry_btn=act_save)
+    t5 = pane(page, 5)
+    def term_text():
+        t = t5.inner_text()
+        return t if "Term Loan For Current FY" in t else None
+    txt5 = wait_for(page, term_text, 15, "term loan summary")
+    m = re.search(r"Term Loan For Current FY.*?₹\s*([\d,]+\.\d+)", txt5.replace("\n", " "), re.S)
+    term = money_to_float(m.group(1)) if m else -1
+    if term != 0:
+        shot(page, f"termloan_{acct}")
+        raise RuntimeError(f"Term Loan For Current FY is {term}, expected 0 (DL != sanctioned?)")
+    t5.locator("button", has_text=BTN("PREVIEW")).first.evaluate("el => el.click()")
+    stage["s"] = "preview"
+
+    # ---- 6. Preview page: verify everything ----
+    wait_for(page, lambda: "/loan-application-preview" in page.url and
+                           "Application Status" in body_text(page), 30, "preview page")
+    page.wait_for_timeout(400)
+    pv = body_text(page).replace("\n", " ")
+    pv = re.sub(r"\s+", " ", pv)
+    problems = []
+    def has(pattern, what):
+        if not re.search(pattern, pv):
+            problems.append(what)
+    has(rf"Account Number\s*{acct}\b", "account number")
+    has(rf"Aadhaar No\.\s*XXXX-XXXX-{aadhaar[-4:]}", "aadhaar last-4")
+    has(rf"KCC loan sanctioned / KCC renewed on\s*{disb:%d/%m/%Y}", "sanction date")
+    def has_amount(label, expected, what):
+        # portal prints Indian grouping (₹1,50,000.00) -> compare numerically
+        m = re.search(label + r"\s*₹\s*([\d,]+(?:\.\d+)?)", pv)
+        if not m or money_to_float(m.group(1)) != float(expected):
+            problems.append(f"{what} (got {m.group(1) if m else 'none'}, want {expected})")
+    has_amount(r"KCC drawing limit for current FY", dp, "drawing limit")
+    has_amount(r"KCC Loan Sanction eligiblity as per SOF", int(elig_new), "eligibility")
+    has_amount(r"Loan Sanctioned \(INR\)", dp, "activity loan sanctioned")
+    has(rf"Sanction/Rollover Date\s*{disb:%d/%m/%Y}", "activity date")
+    detail = f"date={disb:%d/%m/%Y} DL={dp} elig={int(elig)}->{int(elig_new)}"
+    if problems:
+        shot(page, f"preview_{acct}")
+        raise RuntimeError(f"preview mismatch: {', '.join(problems)}")
+
+    if DRY_RUN:
+        shot(page, f"dryrun_{acct}")
+        page.get_by_role("button", name=BTN("BACK")).first.click()
+        page.wait_for_timeout(800)
+        return "DRY_OK", str(dp), "", detail
+
+    if PAUSE_BEFORE_SUBMIT:
+        ans = input(f"\r    submit {acct}?  {detail}  [ENTER=yes / s=skip / q=quit]: ").strip().lower()
+        if ans == "q":
+            raise KeyboardInterrupt("user quit")
+        if ans == "s":
+            page.get_by_role("button", name=BTN("BACK")).first.click()
+            page.wait_for_timeout(800)
+            return "SKIPPED", str(dp), "", detail
+
+    # ---- 7. SUBMIT -> CONFIRM -> OK ----
+    page.get_by_role("button", name=BTN("SUBMIT")).first.click()
+    wait_for(page, lambda: re.search(r"sure you want to submit", modal_text(page), re.I), 15, "confirm dialog")
+    page.locator('.modal-content:visible button', has_text=BTN("CONFIRM")).first.click()
+    stage["s"] = "submitting"
+    def submitted_text():
+        t = modal_text(page)
+        return t if re.search(r"submitted successfully", t, re.I) else None
+    txt = wait_for(page, submitted_text, 40, "submitted-successfully dialog")
+    m = re.search(r"Loan application\s*([0-9]+)\s*submitted", txt, re.I)
+    app_no = m.group(1) if m else ""
+    page.locator('.modal-content:visible button', has_text=BTN("OK")).first.click()
+    stage["s"] = "done"
+    page.wait_for_timeout(600)
+    return "COMPLETED", str(dp), app_no, detail
+
+
+def _recover(page):
+    """Best effort: dismiss dialogs and get back to a state where the popup can be opened."""
+    try:
+        dismiss_ok_dialogs(page)
+    except Exception:
+        pass
+    try:
+        if "/loan-application-preview" in page.url:
+            page.get_by_role("button", name=BTN("BACK")).first.click()
+            page.wait_for_timeout(800)
+    except Exception:
+        pass
+    try:
+        click_side_nav(page, "/dashboard")
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+def main():
+    header, rows, idx = load_rows()
+    a_i, ad_i, d_i, dp_i = idx[COL_ACCT], idx[COL_AADH], idx[COL_DISB], idx[COL_DP]
+    s_i, dl_i, no_i, de_i = idx[COL_STATUS], idx[COL_DL], idx[COL_APPNO], idx[COL_DETAIL]
+
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            PROFILE_DIR, headless=HEADLESS, slow_mo=SLOWMO_MS,
+            viewport=None, args=["--start-maximized"],
+        )
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(BASE, wait_until="domcontentloaded")
+
+        print("\n" + "=" * 70)
+        print("  1. LOG IN in the browser window (mobile + password + captcha).")
+        print("  2. Come back here and press ENTER. Don't touch the browser after that.")
+        print(f"     DRY_RUN={DRY_RUN}  PAUSE_BEFORE_SUBMIT={PAUSE_BEFORE_SUBMIT}  SUBMIT_LIMIT={SUBMIT_LIMIT}")
+        print("=" * 70)
+        if NO_PROMPT:
+            print("  (NO_PROMPT=1: waiting for the login to appear, no ENTER needed)", flush=True)
+            page.wait_for_timeout(2000)
+        else:
+            input("  >> press ENTER once logged in: ")
+        if is_logged_out(page):
+            require_login(page, "Not logged in yet")
+
+        pending = [r for r in rows[1:] if r[a_i].strip() and r[s_i].strip().upper() not in DONE_STATES]
+        total = len(pending)
+        print(f"[start] {total} rows pending\n")
+
+        submitted = walked = 0
+        cnt = {"COMPLETED": 0, "DRY_OK": 0, "NOT_IN_SYSTEM": 0, "ACCT_NOT_IN_DROPDOWN": 0,
+               "NO_AADHAAR": 0, "DP_ZERO": 0, "NO_ACTIVITY": 0, "AADHAAR_REVERIFY": 0, "APPLICANT_INCOMPLETE": 0, "SKIPPED": 0, "ERROR": 0}
+        def tally():
+            return "  ".join(f"{k.lower()} {v}" for k, v in cnt.items() if v)
+
+        stop = False
+        for r in pending:
+            if stop or submitted >= SUBMIT_LIMIT or walked >= MAX_ITER:
+                if submitted >= SUBMIT_LIMIT:
+                    print(f"\n[stop] reached SUBMIT_LIMIT={SUBMIT_LIMIT}")
+                break
+            walked += 1
+            acct = r[a_i].strip()
+            aadhaar = re.sub(r"\D", "", r[ad_i])
+            dp = int(money_to_float(r[dp_i]))
+            try:
+                disb = parse_dmy(r[d_i])
+            except Exception:
+                disb = None
+
+            # ---- pre-checks that need no browser ----
+            if len(aadhaar) != 12:
+                r[s_i], r[de_i] = "NO_AADHAAR", f"aadhaar={r[ad_i].strip()!r}"
+                cnt["NO_AADHAAR"] += 1
+                print(f"[{walked:>4}/{total}] {acct}  NO_AADHAAR")
+                save_rows(header, rows); continue
+            if dp <= 0 and SKIP_DP_ZERO:
+                r[s_i], r[de_i] = "DP_ZERO", "DP is 0"
+                cnt["DP_ZERO"] += 1
+                print(f"[{walked:>4}/{total}] {acct}  DP_ZERO")
+                save_rows(header, rows); continue
+            if disb is None:
+                r[s_i], r[de_i] = "ERROR:BAD_DATE", f"disb={r[d_i]!r}"
+                cnt["ERROR"] += 1
+                print(f"[{walked:>4}/{total}] {acct}  ERROR bad disb date {r[d_i]!r}")
+                save_rows(header, rows); continue
+
+            attempts = 0
+            while True:
+                attempts += 1
+                stage = {"s": "start"}
+                print(f"\r[{walked:>4}/{total}] {acct}  working...        ", end="", flush=True)
+                try:
+                    status, dl, app_no, detail = process_row(page, acct, aadhaar, disb, dp, stage)
+                    r[s_i], r[dl_i], r[no_i], r[de_i] = status, dl, app_no, detail
+                    if status == "COMPLETED":
+                        submitted += 1
+                    cnt[status if status in cnt else "ERROR"] += 1
+                    print(f"\r[{walked:>4}/{total}] {acct}  {status:<21} {detail:<44} "
+                          f"app={app_no or '-':<20} | {tally()}")
+                    break
+                except KeyboardInterrupt:
+                    print("\n[quit] stopping at user request")
+                    stop = True
+                    break
+                except Exception as e:
+                    import traceback
+                    with open("errors.log", "a") as ef:
+                        ef.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} acct={acct} stage={stage['s']} url={page.url}\n")
+                        ef.write(traceback.format_exc())
+                    try:
+                        page.wait_for_timeout(800)
+                    except Exception:
+                        pass
+                    print(f"\n    [exc] stage={stage['s']} url={page.url} {type(e).__name__}: {str(e).splitlines()[0][:160]}", flush=True)
+                    if is_logged_out(page):
+                        shot(page, f"logout_{acct}")
+                        if stage["s"] in ("submitting", "done"):
+                            r[s_i], r[de_i] = f"CHECK_PORTAL:{stage['s']}", str(e)[:80]
+                            cnt["ERROR"] += 1
+                            print(f"\r[{walked:>4}/{total}] {acct}  CHECK_PORTAL  logged out after "
+                                  f"{stage['s']} — verify on portal by hand")
+                            require_login(page)
+                            break
+                        if attempts <= 3:
+                            print(f"\r[{walked:>4}/{total}] {acct}  logged out during {stage['s']} — retry after login")
+                            require_login(page)
+                            continue
+                    kind = "timeout" if isinstance(e, PWTimeout) else type(e).__name__
+                    shot(page, f"error_{acct}")
+                    msg = str(e).splitlines()[0][:90]
+                    r[s_i], r[de_i] = f"ERROR:{kind}", msg
+                    cnt["ERROR"] += 1
+                    print(f"\r[{walked:>4}/{total}] {acct}  ERROR:{kind:<12} {msg:<44} | {tally()}")
+                    _recover(page)
+                    break
+            save_rows(header, rows)
+
+        print(f"\n[done] {submitted} submitted, {walked} walked.  {tally()}.  CSV: {OUTPUT_CSV}")
+        if not NO_PROMPT:
+            input("  >> press ENTER to close the browser: ")
+        ctx.close()
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Enter Fasalrin IS Regular loan applications from a CSV.")
+    ap.add_argument("csv", nargs="?", default=INPUT_CSV,
+                    help=f"input CSV, updated in place (default: {INPUT_CSV})")
+    args = ap.parse_args()
+    if not os.path.isfile(args.csv):
+        ap.error(f"CSV not found: {args.csv}")
+    INPUT_CSV = OUTPUT_CSV = args.csv
+    main()
